@@ -8,6 +8,20 @@ a background worker thread or compiling to a C extension down the line.
 
 import numpy as np
 from typing import Tuple, Dict, Any, Optional
+import time
+import threading
+
+try:
+    from phonotaxis.videoworkers import ProcessWorker
+    from phonotaxis.sharedbuffer import SharedFrameBuffer, ResultBuffer
+    from phonotaxis.resultbus import WorkerResult
+except ImportError:
+    # Fallback to base object if phonotaxis is not on the path
+    ProcessWorker = object
+    SharedFrameBuffer = object
+    ResultBuffer = object
+    WorkerResult = object
+
 
 # Cython-compatible structure placeholder
 class LocomotionState:
@@ -17,7 +31,7 @@ class LocomotionState:
     """
     __slots__ = (
         'timestamp', 'x', 'y', 'velocity', 'heading', 
-        'angular_velocity', 'contingency_met', 'points'
+        'angular_velocity', 'contingency_met', 'points', 'orientation'
     )
     
     def __init__(self):
@@ -29,6 +43,8 @@ class LocomotionState:
         self.angular_velocity: float = 0.0
         self.contingency_met: bool = False
         self.points: int = 0
+        self.orientation: float = 0.0
+
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert state to dictionary for convenient logging/Qt signals."""
@@ -40,7 +56,8 @@ class LocomotionState:
             'heading': self.heading,
             'angular_velocity': self.angular_velocity,
             'contingency_met': self.contingency_met,
-            'points': self.points
+            'points': self.points,
+            'orientation':self.orientation
         }
 
 
@@ -50,8 +67,9 @@ class LocomotionProcessor:
     Uses pre-allocated NumPy ring buffers for memory alignment, suitable for
     GIL-free Cython memoryviews and multi-threaded calculations.
     """
-    def __init__(self, buffer_size: int = 600):
+    def __init__(self, buffer_size: int = 600, smoothing_window: int = 10):
         self.buffer_size = buffer_size
+        self.smoothing_window = smoothing_window
         self.ptr = 0  # Write pointer
         self.count = 0  # Total processed frames
         
@@ -68,8 +86,10 @@ class LocomotionProcessor:
         # Contingency thresholds (modifiable at runtime)
         self.velocity_threshold = 100.0  # px/s
         self.angular_velocity_min = 2.0  # rad/s
-        self.angular_velocity_max = 3.0  # rad/s
+        self.angular_velocity_max = 10.0  # rad/s
         self.point_threshold = 50
+        self.growth_rate = 300
+        self.shrink_rate = 100
         
         # Current accumulated points
         self.current_points = 0
@@ -79,6 +99,15 @@ class LocomotionProcessor:
         self.prev_x = -1.0
         self.prev_y = -1.0
         self.prev_heading = 0.0
+        self.prev_orientation = 0.0
+        
+        # History buffers for smoothing
+        self.history_x = []
+        self.history_y = []
+        self.history_cos = []
+        self.history_sin = []
+        self.history_vel = []
+        self.history_omega = []
         
     def reset(self):
         """Reset the processor state, points, and circular buffers."""
@@ -89,6 +118,7 @@ class LocomotionProcessor:
         self.prev_x = -1.0
         self.prev_y = -1.0
         self.prev_heading = 0.0
+        self.prev_orientation = 0.0
         
         self.buf_timestamps.fill(0)
         self.buf_x.fill(-1)
@@ -99,18 +129,32 @@ class LocomotionProcessor:
         self.buf_points.fill(0)
         self.buf_contingency_met.fill(False)
         
+        self.history_x.clear()
+        self.history_y.clear()
+        self.history_cos.clear()
+        self.history_sin.clear()
+        self.history_vel.clear()
+        self.history_omega.clear()
+        
     def update_contingency_params(self, 
                                   velocity_threshold: float,
                                   angular_velocity_min: float,
                                   angular_velocity_max: float,
-                                  point_threshold: int):
+                                  point_threshold: int,
+                                  growth_rate: int = 300,
+                                  shrink_rate: int = 100,
+                                  smoothing_window: Optional[int] = None):
         """Update kinematic thresholds thread-safely."""
         self.velocity_threshold = velocity_threshold
         self.angular_velocity_min = angular_velocity_min
         self.angular_velocity_max = angular_velocity_max
         self.point_threshold = point_threshold
+        self.growth_rate = growth_rate
+        self.shrink_rate = shrink_rate
+        if smoothing_window is not None:
+            self.smoothing_window = smoothing_window
 
-    def process_frame(self, timestamp: float, centroid: Tuple[int, int]) -> LocomotionState:
+    def process_frame(self, timestamp: float, centroid: Tuple[int, int], orientation: float = 0.0) -> LocomotionState:
         """
         Process a single incoming video frame's coordinates.
         This function performs raw kinematics extraction, aligns temporal signals,
@@ -122,36 +166,90 @@ class LocomotionProcessor:
         state.timestamp = timestamp
         state.x = float(centroid[0])
         state.y = float(centroid[1])
-        
+        state.orientation = orientation
+
         # Avoid division by zero and invalid tracking coordinates (-1, -1)
-        if state.x >= 0 and state.y >= 0 and self.prev_x >= 0 and self.prev_y >= 0:
-            dt = timestamp - self.prev_time
-            if dt > 0.001:  # Prevent division by tiny time slices
-                # Compute velocity: pixel distance / dt
-                dx = state.x - self.prev_x
-                dy = state.y - self.prev_y
-                distance = np.sqrt(dx * dx + dy * dy)
-                state.velocity = distance / dt
+        if state.x >= 0 and state.y >= 0:
+            if self.smoothing_window > 1:
+                # 1. Update coordinate & orientation history
+                self.history_x.append(state.x)
+                self.history_y.append(state.y)
+                self.history_cos.append(np.cos(2 * state.orientation))
+                self.history_sin.append(np.sin(2 * state.orientation))
                 
-                # Compute heading (direction of movement velocity vector)
-                if distance > 0.1:  # Only compute heading if moving
-                    state.heading = np.arctan2(dy, dx)
+                if len(self.history_x) > self.smoothing_window:
+                    self.history_x.pop(0)
+                    self.history_y.pop(0)
+                    self.history_cos.pop(0)
+                    self.history_sin.pop(0)
                     
-                    # Compute angular velocity: change in heading / dt
-                    d_heading = state.heading - self.prev_heading
-                    # Wrap difference to [-pi, pi] to handle wrap-around
-                    d_heading = (d_heading + np.pi) % (2 * np.pi) - np.pi
-                    state.angular_velocity = abs(d_heading) / dt
+                # Compute smoothed coords & orientation
+                smooth_x = np.mean(self.history_x)
+                smooth_y = np.mean(self.history_y)
+                smooth_cos = np.mean(self.history_cos)
+                smooth_sin = np.mean(self.history_sin)
+                smooth_orientation = np.arctan2(smooth_sin, smooth_cos) / 2.0
+            else:
+                smooth_x = state.x
+                smooth_y = state.y
+                smooth_orientation = state.orientation
+            
+            raw_vel = 0.0
+            raw_omega = 0.0
+            
+            # If we have a previous smoothed position/orientation
+            if self.prev_x >= 0 and self.prev_y >= 0:
+                dt = timestamp - self.prev_time
+                if dt < 0.1:
+                    dt = 1/30
+                if dt > 0.001:  # Prevent division by tiny time slices
+                    # Compute velocity: pixel distance / dt using smoothed coordinates
+                    dx = smooth_x - self.prev_x
+                    dy = smooth_y - self.prev_y
+                    distance = np.sqrt(dx * dx + dy * dy)
+                    raw_vel = distance / dt
                     
-                    # Update previous heading
-                    self.prev_heading = state.heading
-                else:
-                    state.heading = self.prev_heading
-                    state.angular_velocity = 0.0
+                    # Compute heading (direction of movement velocity vector)
+                    if distance > 0.1:  # Only compute heading if moving
+                        state.heading = np.arctan2(dy, dx)
+                        self.prev_heading = state.heading
+                    else:
+                        state.heading = self.prev_heading
+                    
+                    # Compute angular velocity: change in orientation / dt
+                    d_orientation = smooth_orientation - self.prev_orientation
+                    # Wrap difference to [-pi/2, pi/2] to handle ellipse orientation wrap-around
+                    d_orientation = (d_orientation + np.pi/2) % np.pi - np.pi/2
+                    raw_omega = abs(d_orientation) / dt
+            else:
+                state.heading = self.prev_heading
+                dt = timestamp
+            if self.smoothing_window > 1:
+                # 2. Update velocity and omega history
+                self.history_vel.append(raw_vel)
+                self.history_omega.append(raw_omega)
+                
+                if len(self.history_vel) > self.smoothing_window:
+                    self.history_vel.pop(0)
+                    self.history_omega.pop(0)
+                    
+                # Compute smoothed velocity and omega
+                state.velocity = np.mean(self.history_vel)
+                state.angular_velocity = np.mean(self.history_omega)
+            else:
+                state.velocity = raw_vel
+                state.angular_velocity = raw_omega
+            
+            # Update previous smoothed values
+            self.prev_x = smooth_x
+            self.prev_y = smooth_y
+            self.prev_time = timestamp
+            self.prev_orientation = smooth_orientation
         else:
             state.velocity = 0.0
             state.heading = self.prev_heading
             state.angular_velocity = 0.0
+            dt = timestamp
             
         # Check contingencies
         v_ok = state.velocity >= self.velocity_threshold
@@ -160,16 +258,12 @@ class LocomotionProcessor:
         
         # Update point accumulation logic (e.g. 1 point for every frame contingency is met)
         if state.contingency_met:
-            self.current_points += 1
+            self.current_points += self.growth_rate*dt
+        else:
+            self.current_points = max(0,self.current_points - self.shrink_rate*dt)
             
         state.points = self.current_points
         
-        # Save previous frame tracking values
-        if state.x >= 0 and state.y >= 0:
-            self.prev_x = state.x
-            self.prev_y = state.y
-            self.prev_time = timestamp
-            
         # Write to circular buffers
         self.buf_timestamps[self.ptr] = state.timestamp
         self.buf_x[self.ptr] = state.x
@@ -231,3 +325,49 @@ class LocomotionProcessor:
         group.create_dataset('points', data=self.buf_points[indices])
         group.create_dataset('contingency_met', data=self.buf_contingency_met[indices])
 
+
+class LocomotionStrategy:
+    """
+    Strategy callable for kinematic processing via the generic
+    ``ProcessWorker``.
+
+    Subscribes to contour-tracker results via the ``ResultBus``
+    (bus mode), eliminating the need for monkey-patching or direct
+    internal buffer access.
+
+    Call signature (bus mode): ``(WorkerResult) -> dict``
+    """
+
+    def __init__(self, processor: LocomotionProcessor):
+        self.processor = processor
+        self.state_lock = threading.Lock()
+        self.latest_state: Optional[LocomotionState] = None
+
+    def __call__(self, msg) -> dict:
+        """
+        Process a contour-tracker result message.
+
+        Args:
+            msg: ``WorkerResult`` from the contour-tracker worker.
+
+        Returns:
+            dict with the computed ``LocomotionState`` fields.
+        """
+        data = msg.data
+        points = data.get('points', ())
+        orientations = data.get('orientations', (0.0,))
+
+        centroid = points[0] if points and len(points) > 0 else (-1, -1)
+        orientation = orientations[0] if orientations else 0.0
+
+        state = self.processor.process_frame(msg.timestamp, centroid, orientation)
+
+        with self.state_lock:
+            self.latest_state = state
+
+        return state.to_dict()
+
+    def get_latest_state(self) -> Optional[LocomotionState]:
+        """Retrieve the last calculated locomotion state thread-safely."""
+        with self.state_lock:
+            return self.latest_state

@@ -10,9 +10,11 @@ GUI freeze, and the results are visualized in real time.
 """
 
 import sys
+import os
+import time
 import numpy as np
 from bidict import bidict
-from PyQt6.QtWidgets import QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLabel
+from PyQt6.QtWidgets import QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLabel, QCheckBox
 from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, QPointF, Qt
 from PyQt6.QtGui import QPainter, QColor, QPen, QPolygonF
 
@@ -30,18 +32,21 @@ from phonotaxis import savedata
 from phonotaxis import config
 
 # Import locomotor processor
-from locomotor_processor import LocomotionProcessor
+from locomotion_processor import LocomotionProcessor, LocomotionStrategy
+from phonotaxis.videoworkers import ProcessWorker
+from phonotaxis.sharedbuffer import ResultBuffer
+
 
 try:
     import cv2
 except ImportError:
     cv2 = None
 
-PARADIGM_NAME = 'locomotor_action_space'
+PARADIGM_NAME = 'locomotion_action_space'
 
 # --- Video tracking defaults ---
-DEFAULT_MASK = [320, 240, 250]
-DEFAULT_IZ_RADIUS_PX = 75
+DEFAULT_MASK = [500, 360, 100]
+DEFAULT_IZ_RADIUS_PX = 150
 
 # --- Sound settings ---
 SAMPLING_RATE = 44100
@@ -68,14 +73,17 @@ class LocomotionWorker(QThread):
     point_scored = pyqtSignal(int)
     goal_reached = pyqtSignal()
 
-    def __init__(self, processor: LocomotionProcessor):
+    def __init__(self, processor: LocomotionProcessor, loco_strategy: LocomotionStrategy = None):
         super().__init__()
         self.processor = processor
+        self.loco_strategy = loco_strategy
         self.goal_notified = False
+        self.last_points = 0.0
 
     def reset_goal(self):
         """Reset the goal flag to allow triggering a new goal."""
         self.goal_notified = False
+        self.last_points = 0.0
 
     @pyqtSlot(float, object, tuple, object)
     def on_frame_processed(self, timestamp: float, frame: np.ndarray, points: tuple, contour: object):
@@ -86,23 +94,29 @@ class LocomotionWorker(QThread):
         # Extract centroid coordinates
         centroid = points[0] if points and len(points) > 0 else (-1, -1)
         
-        # Track prior point state
-        prev_pts = self.processor.current_points
-        
-        # Compute new kinematics state
-        state = self.processor.process_frame(timestamp, centroid)
+        if self.loco_strategy is not None:
+            state = self.loco_strategy.get_latest_state()
+            if state is None:
+                return
+        else:
+            state = self.processor.process_frame(timestamp, centroid)
+            
+        points_value = state.points
+        prev_pts = self.last_points
+        self.last_points = points_value
         
         # Emit calculated state
         self.state_updated.emit(state.to_dict())
         
         # Check if points increased
-        if state.points > prev_pts:
-            self.point_scored.emit(state.points)
+        if points_value > prev_pts:
+            self.point_scored.emit(int(points_value))
             
         # Check if threshold reached
-        if state.points >= self.processor.point_threshold and not self.goal_notified:
+        if points_value >= self.processor.point_threshold and not self.goal_notified:
             self.goal_notified = True
             self.goal_reached.emit()
+
 
 
 class RealTimePlotWidget(QWidget):
@@ -219,10 +233,6 @@ class RealTimePlotWidget(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(int(left_margin), int(top), int(plot_w), int(h), 4.0, 4.0)
         
-        # Horizontal middle grid
-        painter.setPen(QPen(self.grid_color, 1, Qt.PenStyle.DashLine))
-        painter.drawLine(int(left_margin), int(top + h/2), int(left_margin + plot_w), int(top + h/2))
-        
         # Panel Title
         painter.setPen(self.text_color)
         font = painter.font()
@@ -242,14 +252,6 @@ class RealTimePlotWidget(QWidget):
         painter.setPen(trace_color)
         painter.drawText(int(w - right_margin + 12), int(top + h/2 + 5), curr_val_str)
         
-        # Y Axis Bounds
-        painter.setPen(QColor(130, 130, 140))
-        font.setPointSize(7)
-        font.setBold(False)
-        painter.setFont(font)
-        painter.drawText(12, int(top + h - 5), f"{y_min:.1f}")
-        painter.drawText(12, int(top + 12), f"{y_max:.1f}")
-        
         y_range = y_max - y_min
         if y_range <= 0.0:
             y_range = 1.0
@@ -258,6 +260,26 @@ class RealTimePlotWidget(QWidget):
             frac = (val - y_min) / y_range
             frac = max(0.0, min(1.0, frac))
             return top + h - (frac * h)
+            
+        # Draw dynamic axis ticks, labels, and grid lines
+        ticks = np.linspace(y_min, y_max, 5)
+        for i, tick in enumerate(ticks):
+            y_py = to_y_pixel(tick)
+            
+            # Draw tick label on the left margin
+            painter.setPen(QColor(130, 130, 140))
+            font.setPointSize(7)
+            font.setBold(False)
+            painter.setFont(font)
+            painter.drawText(12, int(y_py + 3), f"{tick:.1f}")
+            
+            # Draw small tick mark
+            painter.drawLine(int(left_margin - 4), int(y_py), int(left_margin), int(y_py))
+            
+            # Draw dashed grid line for internal ticks
+            if i > 0 and i < len(ticks) - 1:
+                painter.setPen(QPen(self.grid_color, 1, Qt.PenStyle.DashLine))
+                painter.drawLine(int(left_margin), int(y_py), int(left_margin + plot_w), int(y_py))
             
         # Draw threshold boundary
         if thresh_val is not None:
@@ -310,11 +332,11 @@ class Paradigm(QMainWindow):
         self.session_running = False
         self.controller = controller.SessionController(debug=False)
         
-        # Tracking video display widget
+        # Tracking video display widgetf
         self.video_widget = widgets.VideoWidget(
             controls=True, 
-            threshold=config.DEFAULT_BLACK_THRESHOLD if hasattr(config, 'DEFAULT_BLACK_THRESHOLD') else 128,
-            minarea=config.DEFAULT_MINIMUM_AREA if hasattr(config, 'DEFAULT_MINIMUM_AREA') else 4000,
+            threshold=config.DEFAULT_BLACK_THRESHOLD if hasattr(config, 'DEFAULT_BLACK_THRESHOLD') else 64,
+            minarea=config.DEFAULT_MINIMUM_AREA if hasattr(config, 'DEFAULT_MINIMUM_AREA') else 2000,
             initzone_radius=DEFAULT_IZ_RADIUS_PX,
             mask_radius=DEFAULT_MASK[2]
         )
@@ -352,10 +374,16 @@ class Paradigm(QMainWindow):
                                                             group='Locomotion params')
         self.params['angularVelocityMin'] = gui.NumericParam('Angular velocity min', value=2.0, units='rad/s',
                                                             group='Locomotion params')
-        self.params['angularVelocityMax'] = gui.NumericParam('Angular velocity max', value=3.0, units='rad/s',
+        self.params['angularVelocityMax'] = gui.NumericParam('Angular velocity max', value=10.0, units='rad/s',
                                                             group='Locomotion params')
-        self.params['pointThreshold'] = gui.NumericParam('Point threshold', value=50, units='pts',
+        self.params['pointThreshold'] = gui.NumericParam('Point threshold', value=300, units='pts',
                                                             group='Locomotion params')
+        self.params['growthRate'] = gui.NumericParam('Growth rate', value=300, units = 'pts/s',
+                                                     group='Locomotion params')
+        self.params['shrinkRate'] = gui.NumericParam('Shrink rate', value=100, units='pts/s',
+                                                      group='Locomotion params')
+        self.params['smoothingWindow'] = gui.NumericParam('Smoothing window', value=10, units='frames',
+                                                           group='Locomotion params')
         self.loco_params = self.params.layout_group('Locomotion params')
         
         # Audio parameters
@@ -395,6 +423,16 @@ class Paradigm(QMainWindow):
         right_col.addWidget(self.loco_params)
         right_col.addWidget(self.valve_params)
         right_col.addWidget(self.sound_params)
+        
+        # Show configured save directories in the GUI
+        paths_label = QLabel(
+            f"<b>Data dir:</b> {config.DATA_PATH}<br>"
+            f"<b>Video dir:</b> {config.VIDEO_PATH}"
+        )
+        paths_label.setWordWrap(True)
+        paths_label.setStyleSheet("font-size: 10px; color: #555; margin-top: 5px;")
+        right_col.addWidget(paths_label)
+        
         right_col.addStretch()
 
         # -- Initialize cameras --
@@ -402,7 +440,21 @@ class Paradigm(QMainWindow):
 
         # -- Initialize processing pipeline --
         self.processor = LocomotionProcessor()
-        self.worker = LocomotionWorker(self.processor)
+        self.loco_strategy = LocomotionStrategy(self.processor)
+        
+        # Create a bus-driven ProcessWorker for locomotion analysis
+        loco_result_buffer = ResultBuffer()
+        self.loco_process_worker = ProcessWorker(
+            strategy=self.loco_strategy,
+            result_buffer=loco_result_buffer,
+            name='locomotion',
+            bus=self.video_thread.result_bus,
+            subscribe_to='contour_tracker',
+        )
+        self.video_thread.add_process_worker(self.loco_process_worker)
+        
+        self.worker = LocomotionWorker(self.processor, self.loco_strategy)
+
         
         # Connect signals
         self.worker.state_updated.connect(self.plot_widget.update_data)
@@ -440,6 +492,13 @@ class Paradigm(QMainWindow):
             self.interface.show()
             
         self.interface.connect_state_machine(self.controller.state_machine)
+        
+        # Initialize processor parameters and plot widget parameters from the GUI settings
+        self.update_processor_params()
+
+        # Connect GUI parameters to update the processor and plot widget in real-time
+        for key in ['velocityThreshold', 'angularVelocityMin', 'angularVelocityMax', 'pointThreshold', 'growthRate', 'shrinkRate', 'smoothingWindow']:
+            self.params[key].editWidget.textChanged.connect(self.update_processor_params)
 
     def _show_message(self, msg):
         self.statusBar().showMessage(str(msg))
@@ -459,13 +518,43 @@ class Paradigm(QMainWindow):
 
     def start_video_thread(self):
         """Spawn the background frame grabbing thread."""
-        self.video_thread = videomodule.VideoThread(config.CAMERA_INDEX, mode='binary',
-                                                    tracking=True)
+        video_source = getattr(config, 'VIDEO_PLAYBACK_PATH', None)
+        fps_limit = getattr(config, 'VIDEO_PLAYBACK_FPS', None)
+        loop = getattr(config, 'VIDEO_PLAYBACK_LOOP', False)
+        
+        if video_source is None:
+            video_source = config.CAMERA_INDEX
+            
+        self.video_thread = videomodule.VideoThread(
+            video_source,
+            mode='binary',
+            tracking=True,
+            fps_limit=fps_limit,
+            loop=loop,
+            start_paused=isinstance(video_source, str)
+        )
         # Apply standard settings
         self.video_thread.set_threshold(config.DEFAULT_BLACK_THRESHOLD if hasattr(config, 'DEFAULT_BLACK_THRESHOLD') else 128)
         self.video_thread.set_minarea(config.DEFAULT_MINIMUM_AREA if hasattr(config, 'DEFAULT_MINIMUM_AREA') else 4000)
-        self.video_thread.set_circular_mask(DEFAULT_MASK)
         
+        # Determine actual video dimensions and dynamically scale mask & initzone
+        cap = self.video_thread.cap
+        if cap is not None and cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cx = width // 2
+            cy = height // 2
+            # Scale mask radius relative to default 250 for 640 width
+            radius = int(250 * (width / 640.0))
+            mask = [cx, cy, radius]
+            # Scale initzone radius relative to default
+            iz_radius = int(DEFAULT_IZ_RADIUS_PX * (width / 640.0))
+        else:
+            mask = DEFAULT_MASK
+            cx, cy, radius = DEFAULT_MASK
+            iz_radius = DEFAULT_IZ_RADIUS_PX
+
+        self.video_thread.set_circular_mask(mask)
         self.video_widget.connect_video_thread(self.video_thread)
         
         # Connect initzone slider to custom handler
@@ -474,9 +563,9 @@ class Paradigm(QMainWindow):
                 self._on_iz_radius_changed
             )
             
-        self.iz_radius = DEFAULT_IZ_RADIUS_PX
-        self.iz_cx = DEFAULT_MASK[0]
-        self.iz_cy = DEFAULT_MASK[1]
+        self.iz_radius = iz_radius
+        self.iz_cx = cx
+        self.iz_cy = cy
         
         self.video_thread.frame_processed.connect(self.update_image)
         self.video_thread.start()
@@ -526,21 +615,38 @@ class Paradigm(QMainWindow):
             session_duration = self.session_info.get_value('maxSessionDuration')
             self.controller.set_session_duration(session_duration)
             self.session_running = True
+            
+            # Start video recording
+            subject = self.session_info.get_value('subject')
+            date_str = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+            filename = f"{subject}_{PARADIGM_NAME}_{date_str}.mp4"
+            video_filepath = os.path.join(config.VIDEO_PATH, subject, filename)
+            self.video_thread.start_recording(video_filepath)
+            self.messagebar.collect(f"Video recording started: {video_filepath}")
 
     def stop_session(self):
         """Callback triggered when controller stopping."""
         if self.session_running:
             self.session_running = False
+            self.video_thread.stop_recording()
+            self.messagebar.collect("Video recording stopped.")
 
     def update_processor_params(self):
         """Sync GUI numeric parameters with computational engine."""
-        v_thresh = self.params['velocityThreshold'].get_value()
-        w_min = self.params['angularVelocityMin'].get_value()
-        w_max = self.params['angularVelocityMax'].get_value()
-        p_thresh = int(self.params['pointThreshold'].get_value())
-        
-        self.processor.update_contingency_params(v_thresh, w_min, w_max, p_thresh)
-        self.plot_widget.set_params(v_thresh, w_min, w_max, p_thresh)
+        try:
+            v_thresh = float(self.params['velocityThreshold'].get_value())
+            w_min = float(self.params['angularVelocityMin'].get_value())
+            w_max = float(self.params['angularVelocityMax'].get_value())
+            p_thresh = int(self.params['pointThreshold'].get_value())
+            growth_rate = int(self.params['growthRate'].get_value())
+            shrink_rate = int(self.params['shrinkRate'].get_value())
+            smoothing_window = int(self.params['smoothingWindow'].get_value())
+            
+            self.processor.update_contingency_params(v_thresh, w_min, w_max, p_thresh, growth_rate, shrink_rate, smoothing_window)
+            self.plot_widget.set_params(v_thresh, w_min, w_max, p_thresh)
+        except (ValueError, TypeError):
+            # Ignore temporary invalid parsing states while user is actively typing
+            pass
 
     def prepare_sounds(self):
         """Re-generate waveforms matching adjustments."""
@@ -558,6 +664,7 @@ class Paradigm(QMainWindow):
         sound_reward.add_tone(1200, amplitude, channel='all')
         sound_reward.wave = soundmodule.apply_rise_fall(sound_reward.wave, SAMPLING_RATE, 0.01, 0.01)
         self.sound_player.set_sound(SOUND_ID_REWARD, sound_reward)
+        pass
 
     def on_point_scored(self, current_points):
         """Dynamically generate point-feedback beep."""
@@ -573,6 +680,7 @@ class Paradigm(QMainWindow):
         # Load and play on the fly
         self.sound_player.set_sound(SOUND_ID_TICK, tick_sound)
         self.sound_player.play(SOUND_ID_TICK)
+        pass
 
     def on_goal_reached(self):
         """Locomotor contingency succeeded, trigger virtual event in state machine."""
@@ -586,7 +694,12 @@ class Paradigm(QMainWindow):
     def save_to_file(self):
         """Export raw logs, FSM events, parameter values, and kinematics history to HDF5."""
         subject = self.session_info.get_value('subject')
-        if self.controller.current_trial > 0:
+        if self.controller.current_trial >= 0:
+            # Ensure parameter history is not empty to avoid ValueError in Container.append_to_file
+            for key in self.params._paramsToKeepHistory:
+                if key not in self.params.history or not self.params.history[key]:
+                    self.params.history[key] = [self.params[key].get_value()]
+
             containers = [
                 self.params, self.controller, self.sm, 
                 self.results, self.video_thread, self.processor
@@ -594,8 +707,11 @@ class Paradigm(QMainWindow):
             self.savedata_widget.to_file(containers,
                                          subject=subject,
                                          paradigm=PARADIGM_NAME)
+            self.messagebar.collect("Kinematics and tracking data saved successfully.")
         else:
-            print('No trials completed yet. Data saving skipped.')
+            msg = 'No session has been run. Data saving skipped.'
+            print(msg)
+            self.messagebar.collect(msg)
 
     def prepare_next_trial(self, next_trial):
         """Compile state machine configurations for upcoming trial."""
@@ -680,11 +796,26 @@ class Paradigm(QMainWindow):
         """Graceful thread cleanup on window closing."""
         self.worker.quit()
         self.worker.wait()
-        
+            
         self.interface.close()
         self.video_thread.stop()
         super().closeEvent(event)
 
 
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Locomotor Action Space Paradigm")
+    parser.add_argument("--video", type=str, default=None, help="Path to video file for playback testing")
+    parser.add_argument("--fps-limit", type=float, default=None, help="FPS limit for video playback (0 or negative for benchmark mode)")
+    parser.add_argument("--loop", action="store_true", help="Loop the video file playback")
+    args, unknown = parser.parse_known_args()
+    
+    if args.video:
+        config.VIDEO_PLAYBACK_PATH = args.video
+    if args.fps_limit is not None:
+        config.VIDEO_PLAYBACK_FPS = args.fps_limit
+    if args.loop:
+        config.VIDEO_PLAYBACK_LOOP = True
+
     (app, paradigm) = gui.create_app(Paradigm)
