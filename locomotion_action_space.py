@@ -32,7 +32,7 @@ from phonotaxis import savedata
 from phonotaxis import config
 
 # Import locomotor processor
-from locomotion_processor import LocomotionProcessor, LocomotionStrategy
+from locomotion_processor import LocomotionProcessor
 from phonotaxis.videoworkers import ProcessWorker
 from phonotaxis.sharedbuffer import ResultBuffer
 
@@ -63,59 +63,6 @@ ARDUINO_INPUTS = list(config.INPUT_PINS.keys())
 INPUTS = VIDEO_INPUTS + ARDUINO_INPUTS  # Goal, L, R
 OUTPUTS = list(config.OUTPUT_PINS.keys())
 
-
-class LocomotionWorker(QThread):
-    """
-    Background worker that receives raw camera tracking coordinates,
-    updates the locomotion processor, and emits thread-safe signals for the GUI.
-    """
-    state_updated = pyqtSignal(dict)
-    point_scored = pyqtSignal(int)
-    goal_reached = pyqtSignal()
-
-    def __init__(self, processor: LocomotionProcessor, loco_strategy: LocomotionStrategy = None):
-        super().__init__()
-        self.processor = processor
-        self.loco_strategy = loco_strategy
-        self.goal_notified = False
-        self.last_points = 0.0
-
-    def reset_goal(self):
-        """Reset the goal flag to allow triggering a new goal."""
-        self.goal_notified = False
-        self.last_points = 0.0
-
-    @pyqtSlot(float, object, tuple, object)
-    def on_frame_processed(self, timestamp: float, frame: np.ndarray, points: tuple, contour: object):
-        """
-        Slot connected to VideoThread's frame_processed signal.
-        Processes kinematics in a thread-safe background loop.
-        """
-        # Extract centroid coordinates
-        centroid = points[0] if points and len(points) > 0 else (-1, -1)
-        
-        if self.loco_strategy is not None:
-            state = self.loco_strategy.get_latest_state()
-            if state is None:
-                return
-        else:
-            state = self.processor.process_frame(timestamp, centroid)
-            
-        points_value = state.points
-        prev_pts = self.last_points
-        self.last_points = points_value
-        
-        # Emit calculated state
-        self.state_updated.emit(state.to_dict())
-        
-        # Check if points increased
-        if points_value > prev_pts:
-            self.point_scored.emit(int(points_value))
-            
-        # Check if threshold reached
-        if points_value >= self.processor.point_threshold and not self.goal_notified:
-            self.goal_notified = True
-            self.goal_reached.emit()
 
 
 
@@ -440,32 +387,25 @@ class Paradigm(QMainWindow):
 
         # -- Initialize processing pipeline --
         self.processor = LocomotionProcessor()
-        self.loco_strategy = LocomotionStrategy(self.processor)
         
         # Create a bus-driven ProcessWorker for locomotion analysis
         loco_result_buffer = ResultBuffer()
         self.loco_process_worker = ProcessWorker(
-            strategy=self.loco_strategy,
+            strategy=self.processor,
             result_buffer=loco_result_buffer,
             name='locomotion',
             bus=self.video_thread.result_bus,
             subscribe_to='contour_tracker',
+            latest_only=True,
         )
         self.video_thread.add_process_worker(self.loco_process_worker)
         
-        self.worker = LocomotionWorker(self.processor, self.loco_strategy)
-
+        # Goal-tracking state (previously in LocomotionWorker)
+        self.goal_notified = False
+        self._last_points = 0.0
         
-        # Connect signals
-        self.worker.state_updated.connect(self.plot_widget.update_data)
-        self.worker.point_scored.connect(self.on_point_scored)
-        self.worker.goal_reached.connect(self.on_goal_reached)
-        
-        # Route frames into background worker thread
-        self.video_thread.frame_processed.connect(self.worker.on_frame_processed)
-        
-        # Startup computation thread
-        self.worker.start()
+        # Poll locomotion results on each frame to drive GUI feedback
+        self.video_thread.frame_processed.connect(self._on_loco_state)
 
         # -- Audio interface --
         self.sound_player = soundmodule.SoundPlayer()
@@ -578,6 +518,35 @@ class Paradigm(QMainWindow):
         frame_out = self._draw_overlays(frame)
         self.video_widget.display_frame(frame_out, points, contour=contour)
 
+    def _on_loco_state(self, timestamp, frame, points, contour):
+        """
+        Poll the latest locomotion state from the ProcessWorker's strategy
+        and drive GUI feedback (plot, point sounds, goal detection).
+
+        This runs in the main thread on each frame_processed signal.
+        The actual kinematics computation has already completed GIL-free
+        inside the locomotion ProcessWorker's thread.
+        """
+        state = self.processor.get_latest_state()
+        if state is None:
+            return
+
+        points_value = state.points
+        prev_pts = self._last_points
+        self._last_points = points_value
+
+        # Update real-time plot
+        self.plot_widget.update_data(state.to_dict())
+
+        # Auditory feedback on point increment
+        if points_value > prev_pts:
+            self.on_point_scored(int(points_value))
+
+        # Goal detection
+        if points_value >= self.processor.point_threshold and not self.goal_notified:
+            self.goal_notified = True
+            self.on_goal_reached()
+
     def _draw_overlays(self, frame):
         """Draw the IZ circle on the (grayscale) display frame."""
         if cv2 is None or frame is None:
@@ -591,7 +560,7 @@ class Paradigm(QMainWindow):
             r = int(self.iz_radius)
             
             # Dynamic visualization depending on goal state
-            if self.worker.goal_notified:
+            if self.goal_notified:
                 intensity = 255
                 thickness = 3
             elif getattr(self, 'session_running', False):
@@ -656,13 +625,13 @@ class Paradigm(QMainWindow):
         # Static chime when reward zone becomes unlocked
         sound_beacon = soundmodule.Sound(duration=duration, srate=SAMPLING_RATE)
         sound_beacon.add_tone(600, amplitude, channel='all')
-        sound_beacon.wave = soundmodule.apply_rise_fall(sound_beacon.wave, SAMPLING_RATE, 0.01, 0.01)
+        sound_beacon.apply_rise_fall(0.01, 0.01)
         self.sound_player.set_sound(SOUND_ID_BEACON, sound_beacon)
         
         # Water port reward click
         sound_reward = soundmodule.Sound(duration=0.5, srate=SAMPLING_RATE)
         sound_reward.add_tone(1200, amplitude, channel='all')
-        sound_reward.wave = soundmodule.apply_rise_fall(sound_reward.wave, SAMPLING_RATE, 0.01, 0.01)
+        sound_reward.apply_rise_fall(0.01, 0.01)
         self.sound_player.set_sound(SOUND_ID_REWARD, sound_reward)
         pass
 
@@ -675,7 +644,7 @@ class Paradigm(QMainWindow):
         freq = 400 + 10 * current_points
         tick_sound = soundmodule.Sound(duration=0.06, srate=SAMPLING_RATE)
         tick_sound.add_tone(freq, amp=0.1)
-        tick_sound.wave = soundmodule.apply_rise_fall(tick_sound.wave, SAMPLING_RATE, 0.003, 0.003)
+        tick_sound.apply_rise_fall(0.003, 0.003)
         
         # Load and play on the fly
         self.sound_player.set_sound(SOUND_ID_TICK, tick_sound)
@@ -722,7 +691,8 @@ class Paradigm(QMainWindow):
 
         # Clear buffers & flags
         self.processor.reset()
-        self.worker.reset_goal()
+        self.goal_notified = False
+        self._last_points = 0.0
         self.plot_widget.clear_data()
         self.update_processor_params()
         self.prepare_sounds()
@@ -794,9 +764,6 @@ class Paradigm(QMainWindow):
 
     def closeEvent(self, event):
         """Graceful thread cleanup on window closing."""
-        self.worker.quit()
-        self.worker.wait()
-            
         self.interface.close()
         self.video_thread.stop()
         super().closeEvent(event)

@@ -450,6 +450,7 @@ class Paradigm(QMainWindow):
             name='locomotion',
             bus=self.video_thread.result_bus,
             subscribe_to='contour_tracker',
+            latest_only=True,
         )
         self.video_thread.add_process_worker(self.loco_process_worker)
         
