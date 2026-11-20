@@ -12,9 +12,17 @@ Shaping version of ``click_only_6_port_localization.py``. Differences:
    the original task's behavior). The checkbox is locked once the
    session starts, and saved as ``task_params/incorrect_poke_ends_trial``
    in the HDF5 file and ``incorrect_poke_ends_trial`` in the CSV log.
-   With it unchecked, trial outcomes are only 'correct' or 'timeout';
-   wrong pokes are still available from ``other_poke_detected`` /
-   ``other_poke_time`` and the session event log.
+   With it unchecked, trial outcomes are only 'correct' or 'timeout'.
+   Two per-trial fields (HDF5 ``trials/``) describe wrong pokes:
+     - ``n_incorrect_pokes_before_correct``: non-target pokes before the
+       first target poke (or before trial end if no correct poke). Pokes
+       after the reward (during post-poke sound) are NOT counted.
+       Correct on first try <=> outcome == correct and this == 0.
+     - ``first_poked_port``: port enum of the first poke (-1 if none).
+   Note that ``other_port_poke_detected`` / ``first_incorrect_poke_sec``
+   and ``n_pokes_incorrect_port`` DO include pokes after the reward.
+   The trial log (GUI only) shows "Nerr+Correct", and the CSV summary
+   has ``n_correct_first_try``.
 2. Larger initiation zone and shorter dwell by default
    (DEFAULT_IZ_RADIUS_PX = 150, DEFAULT_DWELL_SEC = 0.2).
 3. PARADIGM_NAME is 'click_only_6_port_shaping', so data files, videos,
@@ -1483,6 +1491,11 @@ class PokeTracker:
         self.other_poke_time = None
         # Complete trial poke log: list of (absolute_time, port_key)
         self.all_pokes: List[tuple] = []
+        # Shaping: first port poked in the trial (None if no poke), and
+        # number of non-target pokes BEFORE the first target poke (pokes
+        # after the reward, e.g. during post-poke sound, are not counted).
+        self.first_poked_port = None
+        self.n_incorrect_before_correct = 0
 
     def start_trial(self, port_key, onset_time, active_set):
         self.trial_active = True
@@ -1494,12 +1507,18 @@ class PokeTracker:
         self.other_poke_detected = False
         self.other_poke_time = None
         self.all_pokes = []
+        self.first_poked_port = None
+        self.n_incorrect_before_correct = 0
 
     def on_poke(self, port_key, poke_time):
         if not self.trial_active:
             return
         # Always record in the per-trial log
         self.all_pokes.append((poke_time, port_key))
+        if self.first_poked_port is None:
+            self.first_poked_port = port_key
+        if port_key != self.active_port and not self.active_poke_detected:
+            self.n_incorrect_before_correct += 1
         # First-of-type bookkeeping (target vs other-active)
         if port_key == self.active_port and not self.active_poke_detected:
             self.active_poke_detected = True
@@ -1523,6 +1542,8 @@ class PokeTracker:
             'latency': latency,
             'other_poke_detected': self.other_poke_detected,
             'other_poke_time': self.other_poke_time,
+            'first_poked_port': self.first_poked_port,
+            'n_incorrect_before_correct': self.n_incorrect_before_correct,
             'all_pokes': list(self.all_pokes),
             'n_pokes_active_port': sum(
                 1 for _, p in self.all_pokes if p == self.active_port
@@ -1770,7 +1791,8 @@ class TrialEventLog(QGroupBox):
         self.setLayout(layout)
 
     def add_trial(self, trial_num, time_str, port_key, outcome,
-                  latency, dwell_sec, poked_port=None):
+                  latency, dwell_sec, poked_port=None,
+                  n_errors_before_correct=0):
         """Add a completed trial row to the table.
 
         ``port_key`` is the trial's TARGET port. ``poked_port``, when
@@ -1790,6 +1812,10 @@ class TrialEventLog(QGroupBox):
         # poked so the experimenter can see the error pattern at a glance.
         if outcome == 'incorrect' and poked_port:
             outcome_str = f"Incorrect ({poked_port})"
+        # Shaping: correct after poking elsewhere first (kept short to fit
+        # the column), e.g. "2err+Correct"
+        if outcome == 'correct' and n_errors_before_correct > 0:
+            outcome_str = f"{n_errors_before_correct}err+Correct"
 
         items = [
             QTableWidgetItem(str(trial_num + 1)),
@@ -4508,6 +4534,9 @@ class Paradigm(QMainWindow):
             'n_pokes_incorrect_port': poke_result['n_pokes_other_port'],
             'n_pokes_inactive_ports':
                 poke_result['n_pokes_inactive_ports'],
+            'first_poked_port': poke_result['first_poked_port'],
+            'n_incorrect_pokes_before_correct':
+                poke_result['n_incorrect_before_correct'],
             'trial_ended_by_port': self._trial_ended_by_port,
             'ended_by_inactive_port': bool(
                 self._trial_ended_by_port is not None
@@ -4540,6 +4569,7 @@ class Paradigm(QMainWindow):
             trial_num, time_str, port_key, outcome,
             poke_result['latency'], self.current_trial_dwell,
             poked_port=self._trial_ended_by_port,
+            n_errors_before_correct=poke_result['n_incorrect_before_correct'],
         )
 
         # Console diagnostics
@@ -4552,7 +4582,10 @@ class Paradigm(QMainWindow):
               f"Dwell={self.current_trial_dwell}, "
               f"Pokes (target/non-target)="
               f"{poke_result['n_pokes_active_port']}/"
-              f"{poke_result['n_pokes_other_port']}")
+              f"{poke_result['n_pokes_other_port']}, "
+              f"FirstPoked={poke_result['first_poked_port']}, "
+              f"ErrorsBeforeCorrect="
+              f"{poke_result['n_incorrect_before_correct']}")
 
         # Record parameter values for this trial
         self.params.update_history(trial_num)
@@ -4934,6 +4967,26 @@ class Paradigm(QMainWindow):
                     trials.create_dataset(
                         'n_pokes_inactive_ports', data=npokes_inactive
                     )
+                    # Shaping fields. first_poked_port: port enum of the
+                    # first poke in the trial (-1 if no poke). Correct on
+                    # first try <=> outcome == correct and
+                    # n_incorrect_pokes_before_correct == 0. Pokes after
+                    # the reward (post-poke sound) are not counted.
+                    first_poked = np.array(
+                        [PORT_TO_INT.get(t.get('first_poked_port'), -1)
+                         for t in self.trial_data], dtype=np.int8
+                    )
+                    trials.create_dataset(
+                        'first_poked_port', data=first_poked
+                    )
+                    n_errors_before_correct = np.array(
+                        [t['n_incorrect_pokes_before_correct']
+                         for t in self.trial_data], dtype=np.int32
+                    )
+                    trials.create_dataset(
+                        'n_incorrect_pokes_before_correct',
+                        data=n_errors_before_correct
+                    )
                     # Which port (enum int) caused the trial to end.
                     # -1 if the trial timed out (no poke). For an
                     # incorrect trial this is the non-target port the
@@ -5269,6 +5322,11 @@ class Paradigm(QMainWindow):
             'total_incorrect': stats['total_incorrect'],
             'total_timeouts': stats['total_timeouts'],
             'total_rewards': stats['total_rewards'],
+            'n_correct_first_try': sum(
+                1 for trial in self.trial_data
+                if trial['outcome'] == 'correct'
+                and trial['n_incorrect_pokes_before_correct'] == 0
+            ),
             'correct_rate_pct': f"{stats['correct_rate']:.1f}",
             'reward_rate_pct': f"{stats['reward_rate']:.1f}",
             'mean_latency_sec': (f"{mean_lat:.3f}"
