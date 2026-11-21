@@ -688,7 +688,7 @@ class PerformanceDashboard(QGroupBox):
         layout.setSpacing(6)
 
         # Paradigm label
-        lbl = QLabel("6-Port Localization (click-only)")
+        lbl = QLabel("6-Port Shaping (click-only)")
         lbl.setStyleSheet(
             "font-weight: bold; font-size: 12pt; color: #FF9800;"
         )
@@ -2175,7 +2175,7 @@ class DataPathsWidget(QGroupBox):
 
 class Paradigm(QMainWindow):
     """
-    Main window for the 6-Port Localization paradigm.
+    Main window for the 6-Port Shaping paradigm.
 
     Fully automated: the mouse initiates trials by dwelling in a central
     Initiation Zone. All 6 ports are active; the target is drawn uniformly
@@ -2188,7 +2188,7 @@ class Paradigm(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Click-Only 6-Port Localization — Automated")
+        self.setWindowTitle("Click-Only 6-Port Shaping — Automated")
         self.setWindowIcon(gui.create_icon())
         self.setMinimumSize(900, 600)
 
