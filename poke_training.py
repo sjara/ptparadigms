@@ -3672,7 +3672,7 @@ class Paradigm(QMainWindow):
         self.blocked_rule_combo.setEnabled(False)
 
         # Start timer
-        self.dashboard_timer.start(500)
+        self.dashboard_timer.start(1000)  # 1 s (dashboard, clock, session end)
 
         # Start video recording
         video_dir = os.path.join(video_path, subject)
