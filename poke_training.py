@@ -364,7 +364,7 @@ BLOCKED_PORTS_RULES: Dict[str, str] = {
     'last_port': 'Last rewarded port',
     'last_port_and_neighbors': 'Last rewarded port + its 2 neighbors',
 }
-DEFAULT_BLOCKED_PORTS_RULE = 'last_port'
+DEFAULT_BLOCKED_PORTS_RULE = 'last_port_and_neighbors'
 DEFAULT_REWARD_SOUND_SEC = 1.0
 
 
